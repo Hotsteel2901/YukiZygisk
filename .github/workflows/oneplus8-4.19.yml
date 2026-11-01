@@ -1,0 +1,520 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# YukiZygisk - OnePlus 8 (sm8250, Linux 4.19.325) build workflow.
+#
+# Builds the kernel module against the LineageOS 24.0 kernel for the OnePlus 8
+# family (instantnoodle / instantnoodlep / kebab), then packages a
+# device-specific Magisk/KernelSU module ZIP together with the regular
+# userspace payloads.
+#
+# License: Apache-2.0
+
+name: Build OnePlus 8 (4.19)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: Kernel repository
+        required: false
+        default: LineageOS/android_kernel_oneplus_sm8250
+        type: string
+      kernel_ref:
+        description: Kernel branch, tag or commit
+        required: false
+        default: lineage-24.0
+        type: string
+      release:
+        description: Publish the packaged ZIP as a GitHub pre-release
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches:
+      - main
+    paths:
+      - "kernel/**"
+      - "module/**"
+      - "shared/**"
+      - "tools/**"
+      - "build.sh"
+      - ".github/workflows/oneplus8-4.19.yml"
+  pull_request:
+    paths:
+      - "kernel/**"
+      - "module/**"
+      - "shared/**"
+      - "tools/**"
+      - "build.sh"
+      - ".github/workflows/oneplus8-4.19.yml"
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  VIOLA_NDK_VERSION: "29.0.14206865"
+  YZ_KMI: oneplus8-4.19
+  YZ_KMI_ID: "9"
+  KERNEL_REPO: ${{ inputs.kernel_repo || 'LineageOS/android_kernel_oneplus_sm8250' }}
+  KERNEL_REF: ${{ inputs.kernel_ref || 'lineage-24.0' }}
+
+jobs:
+  prepare-viola:
+    name: Prepare Viola build context
+    runs-on: ubuntu-latest
+    outputs:
+      signing: ${{ steps.signing.outputs.profile }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tools/requirements-viola.txt
+
+      - name: Install certificate verification dependencies
+        run: python3 -m pip install -r tools/requirements-viola.txt
+
+      - name: Select fixed Android NDK
+        run: |
+          set -euo pipefail
+          viola_ndk_root="${ANDROID_HOME:?Android SDK is unavailable}/ndk/$VIOLA_NDK_VERSION"
+          if [ ! -f "$viola_ndk_root/source.properties" ]; then
+            sdkmanager --sdk_root="$ANDROID_HOME" --install "ndk;$VIOLA_NDK_VERSION"
+          fi
+          viola_ndk_revision="$(sed -n 's/^Pkg.Revision *= *//p' "$viola_ndk_root/source.properties" | tr -d '\r')"
+          test "$viola_ndk_revision" = "$VIOLA_NDK_VERSION"
+          printf 'ANDROID_NDK_HOME=%s\nANDROID_NDK=%s\n' "$viola_ndk_root" "$viola_ndk_root" >> "$GITHUB_ENV"
+
+      - name: Select signing profile
+        id: signing
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -n "${GPG_PRIVATE_KEY:-}" ]; then
+            profile=official
+          else
+            # A fork has no access to the pinned publisher key, so fall back to
+            # a throw-away development key that is generated for this run only.
+            profile=dev
+          fi
+          echo "profile=$profile" >> "$GITHUB_OUTPUT"
+          echo "YZ_SIGN_PROFILE=$profile" >> "$GITHUB_ENV"
+
+      - name: Generate development signing key
+        if: steps.signing.outputs.profile == 'dev'
+        run: |
+          set -euo pipefail
+          signing_home="$RUNNER_TEMP/dev-signing"
+          install -d -m 0700 "$signing_home"
+          echo "GNUPGHOME=$signing_home" >> "$GITHUB_ENV"
+          gpg --batch --pinentry-mode loopback --passphrase '' \
+            --quick-gen-key "YukiZygisk CI development key <dev@invalid>" \
+            ed25519 cert never
+          primary="$(gpg --list-keys --with-colons |
+            awk -F: '/^fpr/ { print $10; exit }')"
+          gpg --batch --pinentry-mode loopback --passphrase '' \
+            --quick-add-key "$primary" ed25519 sign never
+          signer="$(gpg --list-keys --with-colons --with-subkey-fingerprint |
+            awk -F: '/^sub/ { seen = 1; next } seen && /^fpr/ { print $10; exit }')"
+          test -n "$signer"
+          echo "VIOLA_KEY=$signer" >> "$GITHUB_ENV"
+          gpg --batch --armor --export-secret-keys "$primary" \
+            > "$RUNNER_TEMP/dev-signing-key.asc"
+
+      - name: Build fixed-trust Viola and loader identity
+        run: ./build.sh viola --viola-profile "$YZ_SIGN_PROFILE"
+
+      - name: Upload public build context
+        uses: actions/upload-artifact@v6
+        with:
+          name: oneplus8-4.19-viola-context
+          path: |
+            build/viola/context.json
+            build/viola/publisher.pgp
+            build/viola/viola_build.h
+            build/viola/viola_loader.h
+            build/viola/loader.json
+          if-no-files-found: error
+
+      - name: Upload frozen Viola executable
+        uses: actions/upload-artifact@v6
+        with:
+          name: oneplus8-4.19-viola
+          path: build/out/viola
+          if-no-files-found: error
+
+      - name: Upload development signing key
+        if: steps.signing.outputs.profile == 'dev'
+        uses: actions/upload-artifact@v6
+        with:
+          name: oneplus8-4.19-dev-signing-key
+          path: ${{ runner.temp }}/dev-signing-key.asc
+          retention-days: 1
+          if-no-files-found: error
+
+  build-lkm:
+    name: Build ${{ env.YZ_KMI }} kernel module
+    needs: prepare-viola
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.kernel_repo || 'LineageOS/android_kernel_oneplus_sm8250' }}
+          ref: ${{ inputs.kernel_ref || 'lineage-24.0' }}
+          path: kernel-src
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install kernel build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            bc binutils-aarch64-linux-gnu bison flex \
+            gcc-aarch64-linux-gnu libelf-dev libssl-dev
+
+      - name: Read kernel commit
+        id: krev
+        working-directory: kernel-src
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore kernel object cache
+        uses: actions/cache@v4
+        with:
+          path: kernel-out
+          key: kona-4.19-${{ steps.krev.outputs.sha }}-${{ hashFiles('kernel-src/arch/arm64/configs/vendor/kona-perf_defconfig', 'kernel-src/arch/arm64/configs/vendor/oplus.config') }}
+          restore-keys: |
+            kona-4.19-${{ steps.krev.outputs.sha }}-
+
+      - name: Configure kernel
+        working-directory: kernel-src
+        run: |
+          set -euo pipefail
+          make ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- O="$GITHUB_WORKSPACE/kernel-out" \
+            vendor/kona-perf_defconfig
+          ARCH=arm64 scripts/kconfig/merge_config.sh -m \
+            -O "$GITHUB_WORKSPACE/kernel-out" \
+            "$GITHUB_WORKSPACE/kernel-out/.config" \
+            arch/arm64/configs/vendor/oplus.config
+          make ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- O="$GITHUB_WORKSPACE/kernel-out" \
+            olddefconfig
+          grep -E '^CONFIG_(MODULES|MODVERSIONS|KPROBES|SECURITY_SELINUX|OPLUS_SM8250_CHARGER)=y' \
+            "$GITHUB_WORKSPACE/kernel-out/.config"
+
+      - name: Build vmlinux and Module.symvers
+        working-directory: kernel-src
+        run: |
+          set -euo pipefail
+          # Vendor drivers predate clang 18 and rely on relaxed diagnostics.
+          make -j"$(nproc)" ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- O="$GITHUB_WORKSPACE/kernel-out" \
+            KCFLAGS="-Wno-error -Wno-implicit-function-declaration -Wno-visibility -Wno-incompatible-pointer-types -Wno-int-conversion" \
+            vmlinux
+          test -s "$GITHUB_WORKSPACE/kernel-out/Module.symvers"
+          cat "$GITHUB_WORKSPACE/kernel-out/include/config/kernel.release"
+
+      - name: Checkout YukiZygisk
+        uses: actions/checkout@v6
+        with:
+          path: yukizygisk
+          persist-credentials: false
+
+      - name: Download Viola build context
+        uses: actions/download-artifact@v7
+        with:
+          name: oneplus8-4.19-viola-context
+          path: yukizygisk/build/viola
+
+      - name: Build kernel module
+        working-directory: yukizygisk
+        run: |
+          set -euo pipefail
+          make -C kernel -j"$(nproc)" \
+            KDIR="$GITHUB_WORKSPACE/kernel-out" \
+            ARCH=arm64 CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            VIOLA_KMI_ID="$YZ_KMI_ID"
+          test -s kernel/yukizygisk.ko
+          mkdir -p build/out/lkm
+          cp kernel/yukizygisk.ko "build/out/lkm/${YZ_KMI}_yukizygisk.ko"
+          llvm-strip -d "build/out/lkm/${YZ_KMI}_yukizygisk.ko"
+          cp "$GITHUB_WORKSPACE/kernel-out/Module.symvers" build/out/lkm/Module.symvers
+          cp "$GITHUB_WORKSPACE/kernel-out/include/config/kernel.release" build/out/lkm/kernel.release
+          ls -lh build/out/lkm
+          modinfo build/out/lkm/${YZ_KMI}_yukizygisk.ko || true
+
+      - name: Verify no unresolved symbols
+        working-directory: yukizygisk
+        run: |
+          set -euo pipefail
+          # modpost already resolved every import against Module.symvers; a
+          # non-empty list here means the module references a non-exported
+          # symbol and must not be packaged.
+          unresolved="$(llvm-nm -u "build/out/lkm/${YZ_KMI}_yukizygisk.ko" | awk '{print $2}' | sort -u)"
+          printf '%s\n' "$unresolved"
+          printf '%s\n' "$unresolved" | while read -r symbol; do
+            [ -z "$symbol" ] && continue
+            grep -q "	$symbol	" "$GITHUB_WORKSPACE/kernel-out/Module.symvers" || {
+              echo "unresolved symbol: $symbol" >&2
+              exit 1
+            }
+          done
+
+      - name: Check runtime kallsyms lookups against System.map
+        working-directory: yukizygisk
+        run: |
+          set -euo pipefail
+          python3 tests/kernel-symbols.py \
+            --module "build/out/lkm/${YZ_KMI}_yukizygisk.ko" \
+            --system-map "$GITHUB_WORKSPACE/kernel-out/System.map" \
+            --source kernel
+
+      - name: Upload kernel module
+        uses: actions/upload-artifact@v6
+        with:
+          name: oneplus8-4.19-lkm
+          path: |
+            yukizygisk/build/out/lkm/oneplus8-4.19_yukizygisk.ko
+            yukizygisk/build/out/lkm/Module.symvers
+            yukizygisk/build/out/lkm/kernel.release
+          if-no-files-found: error
+
+  build-userspace:
+    name: Build ARM userspace
+    needs: prepare-viola
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tools/requirements-viola.txt
+
+      - name: Install certificate verification dependencies
+        run: python3 -m pip install -r tools/requirements-viola.txt
+
+      - name: Install module integrity shell tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends busybox dash
+
+      - name: Select fixed Android NDK
+        run: |
+          set -euo pipefail
+          viola_ndk_root="${ANDROID_HOME:?Android SDK is unavailable}/ndk/$VIOLA_NDK_VERSION"
+          if [ ! -f "$viola_ndk_root/source.properties" ]; then
+            sdkmanager --sdk_root="$ANDROID_HOME" --install "ndk;$VIOLA_NDK_VERSION"
+          fi
+          viola_ndk_revision="$(sed -n 's/^Pkg.Revision *= *//p' "$viola_ndk_root/source.properties" | tr -d '\r')"
+          test "$viola_ndk_revision" = "$VIOLA_NDK_VERSION"
+          printf 'ANDROID_NDK_HOME=%s\nANDROID_NDK=%s\n' "$viola_ndk_root" "$viola_ndk_root" >> "$GITHUB_ENV"
+
+      - name: Download shared public build context
+        uses: actions/download-artifact@v7
+        with:
+          name: oneplus8-4.19-viola-context
+          path: build/viola
+
+      - name: Validate module scripts
+        run: |
+          set -euo pipefail
+          bash -n build.sh tests/module-kmi.sh
+          sh -n module/*.sh
+          shellcheck build.sh tests/module-kmi.sh module/*.sh
+          ./tests/module-kmi.sh
+          python3 tests/module-integrity.py
+
+      - name: Build daemon, control client, and runtime payloads
+        run: |
+          set -euo pipefail
+          ./build.sh daemon
+          ./build.sh ctl
+          ./build.sh payloads
+
+      - name: Upload userspace artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: oneplus8-4.19-userspace
+          path: |
+            build/out/zygiskd64
+            build/out/zygiskd32
+            build/out/yzctl
+            build/out/libzygisk64.so
+            build/out/libzygisk32.so
+            build/out/libyukilinker64.so
+            build/out/libyukilinker32.so
+            build/out/libyukizncore64.so
+            build/out/libyukizncore32.so
+          if-no-files-found: error
+
+  package:
+    name: Package OnePlus 8 module
+    needs:
+      - prepare-viola
+      - build-lkm
+      - build-userspace
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: tools/webui/package-lock.json
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tools/requirements-viola.txt
+
+      - name: Install certificate verification dependencies
+        run: python3 -m pip install -r tools/requirements-viola.txt
+
+      - name: Select fixed Android NDK
+        run: |
+          set -euo pipefail
+          viola_ndk_root="${ANDROID_HOME:?Android SDK is unavailable}/ndk/$VIOLA_NDK_VERSION"
+          if [ ! -f "$viola_ndk_root/source.properties" ]; then
+            sdkmanager --sdk_root="$ANDROID_HOME" --install "ndk;$VIOLA_NDK_VERSION"
+          fi
+          viola_ndk_revision="$(sed -n 's/^Pkg.Revision *= *//p' "$viola_ndk_root/source.properties" | tr -d '\r')"
+          test "$viola_ndk_revision" = "$VIOLA_NDK_VERSION"
+          printf 'ANDROID_NDK_HOME=%s\nANDROID_NDK=%s\n' "$viola_ndk_root" "$viola_ndk_root" >> "$GITHUB_ENV"
+
+      - name: Download public build context
+        uses: actions/download-artifact@v7
+        with:
+          name: oneplus8-4.19-viola-context
+          path: build/viola
+
+      - name: Download frozen Viola executable
+        uses: actions/download-artifact@v7
+        with:
+          name: oneplus8-4.19-viola
+          path: build/out
+
+      - name: Download kernel module
+        uses: actions/download-artifact@v7
+        with:
+          name: oneplus8-4.19-lkm
+          path: build/out/lkm
+
+      - name: Download userspace artifacts
+        uses: actions/download-artifact@v7
+        with:
+          name: oneplus8-4.19-userspace
+          path: build/out
+
+      - name: Download development signing key
+        if: needs.prepare-viola.outputs.signing == 'dev'
+        uses: actions/download-artifact@v7
+        with:
+          name: oneplus8-4.19-dev-signing-key
+          path: ${{ runner.temp }}/signing-key
+
+      - name: Import package signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          signing_home="$RUNNER_TEMP/signing-home"
+          install -d -m 0700 "$signing_home"
+          export GNUPGHOME="$signing_home"
+          echo "GNUPGHOME=$signing_home" >> "$GITHUB_ENV"
+          if [ "${{ needs.prepare-viola.outputs.signing }}" = official ]; then
+            test -n "${GPG_PRIVATE_KEY:-}" ||
+              { echo "official signing requires GPG_PRIVATE_KEY" >&2; exit 1; }
+            printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
+            if [ -n "${GPG_PASSPHRASE:-}" ]; then
+              echo "VIOLA_GPG_PASSPHRASE=$GPG_PASSPHRASE" >> "$GITHUB_ENV"
+            fi
+          else
+            gpg --batch --import "$RUNNER_TEMP/signing-key/dev-signing-key.asc"
+          fi
+          gpg --list-secret-keys --with-colons | grep -q '^sec:' ||
+            { echo "no secret signing key imported" >&2; exit 1; }
+
+      - name: Package module
+        run: |
+          set -euo pipefail
+          ./build.sh package --kmi "$YZ_KMI" --skip-viola --skip-kernel \
+            --skip-daemon --skip-ctl --skip-payloads
+          unzip -Z1 build/out/YukiZygisk-*-"$YZ_KMI"-arm64-v8a.zip | sort
+
+      - name: Upload module package
+        uses: actions/upload-artifact@v6
+        with:
+          name: YukiZygisk-${{ env.YZ_KMI }}-module
+          path: build/out/YukiZygisk-*-${{ env.YZ_KMI }}-arm64-v8a.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish pre-release
+    needs:
+      - package
+      - prepare-viola
+    if: github.event_name == 'workflow_dispatch' && inputs.release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download module package
+        uses: actions/download-artifact@v7
+        with:
+          name: YukiZygisk-oneplus8-4.19-module
+          path: dist
+
+      - name: Publish package
+        uses: softprops/action-gh-release@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: oneplus8-4.19-${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          name: YukiZygisk for OnePlus 8 (4.19) build ${{ github.run_number }}
+          prerelease: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/YukiZygisk-*-oneplus8-4.19-arm64-v8a.zip
+          body: |
+            Device-specific build for the OnePlus 8 family (sm8250).
+
+            - Kernel: `${{ inputs.kernel_repo || 'LineageOS/android_kernel_oneplus_sm8250' }}@${{ inputs.kernel_ref || 'lineage-24.0' }}` (Linux 4.19.325)
+            - KMI: `oneplus8-4.19`
+            - Signature profile: `${{ needs.prepare-viola.outputs.signing }}`
+            - Commit: `${{ github.sha }}`
+            - Build: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            The module loader repairs the vermagic at install time, but the module
+            must target the same kernel configuration as the running kernel.
