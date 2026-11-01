@@ -163,7 +163,7 @@ jobs:
           if-no-files-found: error
 
   build-lkm:
-    name: Build ${{ env.YZ_KMI }} kernel module
+    name: Build oneplus8-4.19 kernel module
     needs: prepare-viola
     runs-on: ubuntu-latest
     timeout-minutes: 240
@@ -255,7 +255,7 @@ jobs:
           cp "$GITHUB_WORKSPACE/kernel-out/Module.symvers" build/out/lkm/Module.symvers
           cp "$GITHUB_WORKSPACE/kernel-out/include/config/kernel.release" build/out/lkm/kernel.release
           ls -lh build/out/lkm
-          modinfo build/out/lkm/${YZ_KMI}_yukizygisk.ko || true
+          modinfo "build/out/lkm/${YZ_KMI}_yukizygisk.ko" || true
 
       - name: Verify no unresolved symbols
         working-directory: yukizygisk
@@ -481,8 +481,8 @@ jobs:
       - name: Upload module package
         uses: actions/upload-artifact@v6
         with:
-          name: YukiZygisk-${{ env.YZ_KMI }}-module
-          path: build/out/YukiZygisk-*-${{ env.YZ_KMI }}-arm64-v8a.zip
+          name: YukiZygisk-oneplus8-4.19-module
+          path: build/out/YukiZygisk-*-oneplus8-4.19-arm64-v8a.zip
           if-no-files-found: error
 
   release:
