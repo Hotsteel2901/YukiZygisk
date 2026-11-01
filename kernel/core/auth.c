@@ -37,6 +37,15 @@
 #include <trace/events/sched.h>
 #include <asm/ptrace.h>
 
+#if YZ_KERNEL_LEGACY
+/* 4.x binfmt_misc passes the executable fd through interp_data. */
+#define yz_bprm_have_execfd(bprm) (!!((bprm)->interp_flags & BINPRM_FLAGS_EXECFD))
+#define yz_bprm_execfd(bprm) ((int)(bprm)->interp_data)
+#else
+#define yz_bprm_have_execfd(bprm) ((bprm)->have_execfd)
+#define yz_bprm_execfd(bprm) ((bprm)->execfd)
+#endif
+
 #include <viola.h>
 #include <viola_build.h>
 #include <viola_loader.h>
@@ -338,13 +347,15 @@ static bool yz_auth_record_exec(struct yz_auth_session *s,
 		struct fdtable *fdt;
 
 		if (role != YZ_VIOLA_ARMED32 || !yz_auth_tango_image(bprm->file) ||
-		    !bprm->have_execfd || bprm->execfd < 0 || !files)
+		    !yz_bprm_have_execfd(bprm) || yz_bprm_execfd(bprm) < 0 ||
+		    !files)
 			return false;
 		spin_lock(&files->file_lock);
 		fdt = files_fdtable(files);
-		if ((unsigned int)bprm->execfd < fdt->max_fds)
+		if ((unsigned int)yz_bprm_execfd(bprm) < fdt->max_fds)
 			translated = yz_auth_same_image(image,
-				rcu_dereference_raw(fdt->fd[bprm->execfd]));
+				rcu_dereference_raw(
+					fdt->fd[yz_bprm_execfd(bprm)]));
 		spin_unlock(&files->file_lock);
 		if (!translated)
 			return false;

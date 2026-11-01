@@ -21,13 +21,16 @@
 #include <linux/pid.h>
 #include <linux/printk.h>
 #include <linux/sched.h>
+#include <linux/sched/mm.h>
 #include <linux/sched/task.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/task_work.h>
 #include <linux/types.h>
 #include <linux/vmalloc.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
 #include <uapi/linux/mount.h>
+#endif
 
 #include "host/host.h"
 #include "core/auth.h"
@@ -43,6 +46,65 @@ typedef int (*yz_path_umount_fn)(struct path *path, int flags);
 
 static yz_path_umount_fn yz_path_umount_ptr;
 
+#if YZ_KERNEL_LEGACY
+/*
+ * Linux 4.19 has no path_umount().  The only equivalent entry point is the
+ * private do_umount(struct mount *, int), which takes namespace_sem itself and
+ * consumes no path reference.  struct mount is not part of the module-visible
+ * headers, so the wrapper base is located at run time by matching the embedded
+ * mnt_root/mnt_sb pair; a hard-coded offsetof() would break under randstruct or
+ * a vendor layout change.
+ */
+#define YZ_REAL_MOUNT_SCAN_MAX 4096UL
+
+static int (*yz_do_umount_ptr)(void *mnt, int flags);
+
+static void *yz_real_mount_base(struct vfsmount *vmnt,
+				const struct dentry *root,
+				const struct super_block *sb)
+{
+	unsigned long offset;
+
+	for (offset = sizeof(void *); offset < YZ_REAL_MOUNT_SCAN_MAX;
+	     offset += sizeof(void *)) {
+		unsigned long base = (unsigned long)vmnt - offset;
+		struct {
+			unsigned long root;
+			unsigned long sb;
+		} pair;
+		unsigned long parent;
+
+		if (!yz_kernel_read_nofault(&pair, base, sizeof(pair)))
+			continue;
+		if (pair.root != (unsigned long)root ||
+		    pair.sb != (unsigned long)sb)
+			continue;
+		/* mnt_hash precedes mnt_parent, so the parent slot is always
+		 * two pointers into the wrapper.  Reject candidates whose
+		 * parent slot is not a kernel address. */
+		if (!yz_kernel_read_nofault(&parent, base + 2 * sizeof(void *),
+					    sizeof(parent)))
+			continue;
+		if (!yz_valid_kernel_addr(parent))
+			continue;
+		return (void *)base;
+	}
+	return NULL;
+}
+
+static YZ_INDIRECT_CALL int yz_try_umount_legacy(struct path *path, int flags)
+{
+	void *mnt;
+
+	mnt = yz_real_mount_base(path->mnt, path->dentry, path->mnt->mnt_sb);
+	if (!mnt) {
+		pr_info("yukizygisk: cannot locate struct mount for umount\n");
+		return -ENOENT;
+	}
+	return yz_do_umount_ptr(mnt, flags);
+}
+#endif /* YZ_KERNEL_LEGACY */
+
 static bool yz_mount_is_appuid(uid_t uid)
 {
 	return uid == YZ_AID_WEBVIEW_ZYGOTE ||
@@ -57,12 +119,22 @@ static int yz_mount_resolve_path_umount(void)
 		return 0;
 
 	addr = yz_lookup_callable_quiet("path_umount");
-	if (!addr) {
-		pr_warn("yukizygisk: path_umount unavailable; mount cleanup disabled\n");
-		return -ENOENT;
+	if (addr) {
+		yz_path_umount_ptr = (void *)addr;
+		return 0;
 	}
-	yz_path_umount_ptr = (void *)addr;
-	return 0;
+
+#if YZ_KERNEL_LEGACY
+	if (!yz_do_umount_ptr) {
+		/* do_umount() is static, so only kallsyms can reach it. */
+		yz_do_umount_ptr = (void *)yz_lookup_callable_quiet("do_umount");
+	}
+	if (yz_do_umount_ptr)
+		return 0;
+#endif
+
+	pr_warn("yukizygisk: no umount entry point; mount cleanup disabled\n");
+	return -ENOENT;
 }
 
 static YZ_INDIRECT_CALL int yz_try_umount(const char *mnt, int flags)
@@ -86,8 +158,18 @@ static YZ_INDIRECT_CALL int yz_try_umount(const char *mnt, int flags)
 		return -EINVAL;
 	}
 
-	/* path_umount() consumes the successful kern_path() reference itself. */
-	ret = yz_path_umount_ptr(&path, flags);
+	if (yz_path_umount_ptr) {
+		/* path_umount() consumes the successful kern_path() reference. */
+		ret = yz_path_umount_ptr(&path, flags);
+	} else {
+#if YZ_KERNEL_LEGACY
+		/* do_umount() leaves the reference with its caller. */
+		ret = yz_try_umount_legacy(&path, flags);
+#else
+		ret = -ENOENT;
+#endif
+		yz_path_put(&path);
+	}
 	if (ret)
 		pr_info("yukizygisk: umount %s failed: %d\n", mnt, ret);
 	return ret;

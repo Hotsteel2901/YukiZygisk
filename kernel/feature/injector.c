@@ -18,6 +18,7 @@
 #include <linux/module.h>
 #include <linux/ptrace.h>
 #include <linux/sched.h>
+#include <linux/sched/mm.h>
 #include <linux/sched/task_stack.h>
 #include <linux/slab.h>
 #include <linux/task_work.h>

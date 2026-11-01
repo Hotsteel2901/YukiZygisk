@@ -87,8 +87,9 @@ static int yz_bootstrap_prctl_pre(struct kprobe *kp, struct pt_regs *regs)
 
 	(void)kp;
 	if (yz_bootstrap_abi == YZ_PRCTL_ABI_ARM64_WRAPPER) {
-		if (copy_from_kernel_nofault(&copied,
-				(void *)regs->regs[0], sizeof(copied)))
+		if (!yz_kernel_read_nofault(&copied,
+					    (unsigned long)regs->regs[0],
+					    sizeof(copied)))
 			return 0;
 		sysregs = &copied;
 	}

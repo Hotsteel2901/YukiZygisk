@@ -10,6 +10,7 @@
  */
 
 #include <linux/err.h>
+#include <linux/flex_array.h>
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/lsm_hooks.h>
@@ -41,6 +42,20 @@
 /* avtab_write_item(): four 16-bit key fields and a 32-bit access vector. */
 #define YZ_POLICY_AVTAB_ALLOWED_SIZE (4 * sizeof(u16) + sizeof(u32))
 
+#if YZ_KERNEL_LEGACY
+/*
+ * Linux 4.x keeps the active policy inside struct selinux_ss and has no
+ * struct selinux_policy.  The editor works on a detached serialized copy, so
+ * mirror the two fields it needs; the committed result is installed through
+ * security_load_policy(), which rebuilds the SID table, the class map and the
+ * AVC exactly like a userspace policy reload.
+ */
+struct selinux_policy {
+	struct policydb policydb;
+	struct sidtab *sidtab;
+};
+#endif
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
 extern int avc_ss_reset(u32 seqno);
 #else
@@ -56,7 +71,7 @@ static int
 yz_policy_begin_edit_locked(struct yz_policy_edit *edit);
 static void
 yz_policy_cancel_edit_locked(struct yz_policy_edit *edit);
-static void
+static int
 yz_policy_commit_edit_locked(struct yz_policy_edit *edit);
 
 static DEFINE_MUTEX(yz_policy_lock);
@@ -65,16 +80,80 @@ static struct lsm_blob_sizes *yz_selinux_blob_sizes;
 static typeof(&policydb_write) yz_policydb_write;
 static typeof(&policydb_read) yz_policydb_read;
 static typeof(&policydb_destroy) yz_policydb_destroy;
+#if YZ_KERNEL_LEGACY
+static typeof(&hashtab_search) yz_hashtab_search;
+static typeof(&sidtab_search) yz_sidtab_search_fn;
+static typeof(&security_load_policy) yz_security_load_policy;
+#else
 static typeof(&symtab_search) yz_symtab_search;
+static typeof(&sidtab_search_entry) yz_sidtab_search_entry;
+#endif
 static typeof(&avtab_search_node) yz_avtab_search_node;
 static typeof(&avtab_insert_nonunique) yz_avtab_insert_nonunique;
 static typeof(&avtab_alloc) yz_avtab_alloc;
 static typeof(&avtab_destroy) yz_avtab_destroy;
-static typeof(&sidtab_search_entry) yz_sidtab_search_entry;
 static typeof(&avc_ss_reset) yz_avc_ss_reset;
 static typeof(&selnl_notify_policyload) yz_selnl_notify_policyload;
 static typeof(&selinux_status_update_policyload)
 	yz_selinux_status_update_policyload;
+
+#if YZ_KERNEL_LEGACY
+/* Refreshed by yz_policy_base_lock(); every locked reader uses this view. */
+static struct selinux_policy yz_policy_view;
+
+static void yz_policy_refresh_view_locked(void)
+{
+	struct selinux_ss *ss = yz_selinux_state ? yz_selinux_state->ss : NULL;
+
+	if (!ss)
+		return;
+	read_lock(&ss->policy_rwlock);
+	yz_policy_view.policydb = ss->policydb;
+	yz_policy_view.sidtab = ss->sidtab;
+	read_unlock(&ss->policy_rwlock);
+}
+#endif
+
+static struct selinux_policy *yz_policy_current_locked(void)
+{
+#if YZ_KERNEL_LEGACY
+	return &yz_policy_view;
+#else
+	return rcu_dereference_protected(
+		yz_selinux_state->policy,
+		lockdep_is_held(&yz_selinux_state->policy_mutex));
+#endif
+}
+
+/* Linux 4.x stores avtab buckets and symbol names in flex arrays. */
+static const char *yz_policy_sym_name(struct policydb *db, unsigned int sym,
+				      unsigned int index)
+{
+#if YZ_KERNEL_LEGACY
+	return sym_name(db, sym, index);
+#else
+	return db->sym_val_to_name[sym][index];
+#endif
+}
+
+static struct avtab_node *yz_avtab_slot(struct avtab *table, u32 slot)
+{
+#if YZ_KERNEL_LEGACY
+	return flex_array_get_ptr(table->htable, slot);
+#else
+	return table->htable[slot];
+#endif
+}
+
+static void yz_avtab_set_slot(struct avtab *table, u32 slot,
+			      struct avtab_node *node)
+{
+#if YZ_KERNEL_LEGACY
+	flex_array_put_ptr(table->htable, slot, node, GFP_KERNEL);
+#else
+	table->htable[slot] = node;
+#endif
+}
 
 /* These private SELinux functions need not have named old-CFI jump-table
  * entries. Keep each resolved call in its own boundary, including after LTO. */
@@ -99,7 +178,12 @@ yz_call_policydb_destroy(struct policydb *db)
 static YZ_LEGACY_INDIRECT_CALL void *
 yz_call_symtab_search(struct symtab *table, const char *name)
 {
+#if YZ_KERNEL_LEGACY
+	/* 4.x symtab owns a pointer to a standalone hashtab. */
+	return yz_hashtab_search(table->table, name);
+#else
 	return yz_symtab_search(table, name);
+#endif
 }
 
 static YZ_LEGACY_INDIRECT_CALL struct avtab_node *
@@ -208,10 +292,16 @@ static const struct yz_runtime_policy_class yz_runtime_policy_classes[] = {
 bool yz_policy_base_ready(void)
 {
 	return yz_selinux_state && yz_selinux_blob_sizes && yz_policydb_write &&
-	       yz_policydb_read && yz_policydb_destroy && yz_symtab_search &&
+	       yz_policydb_read && yz_policydb_destroy &&
+#if YZ_KERNEL_LEGACY
+	       yz_hashtab_search && yz_sidtab_search_fn &&
+	       yz_security_load_policy &&
+#else
+	       yz_symtab_search && yz_sidtab_search_entry &&
+#endif
 	       yz_avtab_search_node && yz_avtab_insert_nonunique &&
-	       yz_avtab_alloc && yz_avtab_destroy && yz_sidtab_search_entry &&
-	       yz_avc_ss_reset && yz_selnl_notify_policyload &&
+	       yz_avtab_alloc && yz_avtab_destroy && yz_avc_ss_reset &&
+	       yz_selnl_notify_policyload &&
 	       yz_selinux_status_update_policyload;
 }
 
@@ -229,6 +319,12 @@ static u32 yz_policy_cred_sid(const struct cred *cred)
 static YZ_LEGACY_INDIRECT_CALL struct context *
 yz_policy_sidtab_search(struct sidtab *sidtab, u32 sid)
 {
+#if YZ_KERNEL_LEGACY
+	if (!sidtab || !sid || !yz_sidtab_search_fn)
+		return NULL;
+
+	return yz_sidtab_search_fn(sidtab, sid);
+#else
 	struct sidtab_entry *entry;
 
 	if (!sidtab || !sid || !yz_sidtab_search_entry)
@@ -236,15 +332,14 @@ yz_policy_sidtab_search(struct sidtab *sidtab, u32 sid)
 
 	entry = yz_sidtab_search_entry(sidtab, sid);
 	return entry ? &entry->context : NULL;
+#endif
 }
 
 static const char *yz_policy_type_name_by_value(struct policydb *db, u32 type)
 {
 	if (!db || type == 0 || type > db->p_types.nprim)
 		return NULL;
-	if (!db->sym_val_to_name[SYM_TYPES])
-		return NULL;
-	return db->sym_val_to_name[SYM_TYPES][type - 1];
+	return yz_policy_sym_name(db, SYM_TYPES, type - 1);
 }
 
 static const char *yz_policy_class_name_by_value(struct policydb *db,
@@ -252,9 +347,7 @@ static const char *yz_policy_class_name_by_value(struct policydb *db,
 {
 	if (!db || tclass == 0 || tclass > db->p_classes.nprim)
 		return NULL;
-	if (!db->sym_val_to_name[SYM_CLASSES])
-		return NULL;
-	return db->sym_val_to_name[SYM_CLASSES][tclass - 1];
+	return yz_policy_sym_name(db, SYM_CLASSES, tclass - 1);
 }
 
 static u32
@@ -333,9 +426,7 @@ u32 yz_policy_base_direct_allowed_av(const struct yz_policy_key *key)
 	if (!key || !yz_policy_base_ready())
 		return 0;
 
-	policy = rcu_dereference_protected(
-		yz_selinux_state->policy,
-		lockdep_is_held(&yz_selinux_state->policy_mutex));
+	policy = yz_policy_current_locked();
 	if (!policy)
 		return 0;
 
@@ -381,18 +472,18 @@ yz_policy_remove_avtab_node(struct policydb *db, struct avtab_node *node)
 
 	for (i = 0; i < db->te_avtab.nslot; i++) {
 		prev = NULL;
-		for (cur = db->te_avtab.htable[i]; cur;
+		for (cur = yz_avtab_slot(&db->te_avtab, i); cur;
 		     prev = cur, cur = cur->next) {
 			if (cur != node)
 				continue;
 			if (prev)
 				prev->next = cur->next;
 			else
-				db->te_avtab.htable[i] = cur->next;
+				yz_avtab_set_slot(&db->te_avtab, i, cur->next);
 			if (db->te_avtab.nel)
 				db->te_avtab.nel--;
 			cur->next = NULL;
-			removed.htable[0] = cur;
+			yz_avtab_set_slot(&removed, 0, cur);
 			removed.nel = 1;
 			yz_call_avtab_destroy(&removed);
 			db->len -= YZ_POLICY_AVTAB_ALLOWED_SIZE;
@@ -536,9 +627,7 @@ int yz_host_policy_prepare_runtime_current(void)
 		goto out_unlock;
 	}
 
-	policy = rcu_dereference_protected(
-		yz_selinux_state->policy,
-		lockdep_is_held(&yz_selinux_state->policy_mutex));
+	policy = yz_policy_current_locked();
 	if (!policy) {
 		ret = -ENOENT;
 		goto out_unlock;
@@ -671,7 +760,11 @@ out_free_data:
 
 static YZ_LEGACY_INDIRECT_CALL void yz_policy_reset_avc(void)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+#if YZ_KERNEL_LEGACY
+	/* security_load_policy() already bumped the sequence number, flushed
+	 * the AVC, notified userspace and updated the status page. */
+	return;
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
 	yz_avc_ss_reset(0);
 	yz_selnl_notify_policyload(0);
 	yz_selinux_status_update_policyload(0);
@@ -694,9 +787,7 @@ yz_policy_begin_edit_locked(struct yz_policy_edit *edit)
 	if (!smp_load_acquire(&yz_selinux_state->initialized))
 		return -EAGAIN;
 
-	old_policy = rcu_dereference_protected(
-		yz_selinux_state->policy,
-		lockdep_is_held(&yz_selinux_state->policy_mutex));
+	old_policy = yz_policy_current_locked();
 	if (!old_policy)
 		return -ENOENT;
 
@@ -718,14 +809,69 @@ yz_policy_cancel_edit_locked(struct yz_policy_edit *edit)
 	memset(edit, 0, sizeof(*edit));
 }
 
-static void
+#if YZ_KERNEL_LEGACY
+/*
+ * Serialize the edited database and hand it to security_load_policy(), the
+ * same entry point /sys/fs/selinux/load uses.  It validates the image,
+ * rebuilds the SID table and class map, then swaps ss->policydb under
+ * policy_rwlock and flushes the AVC.
+ */
+static YZ_LEGACY_INDIRECT_CALL int
+yz_policy_install_legacy(struct selinux_policy *policy)
+{
+	struct policy_file fp;
+	void *data;
+	size_t len;
+	int ret;
+
+	if (!yz_security_load_policy)
+		return -EOPNOTSUPP;
+
+	if (check_add_overflow((size_t)policy->policydb.len, (size_t)8192, &len))
+		return -EOVERFLOW;
+
+	data = vmalloc(len);
+	if (!data)
+		return -ENOMEM;
+
+	fp.data = data;
+	fp.len = len;
+	ret = yz_call_policydb_write(&policy->policydb, &fp);
+	if (ret) {
+		pr_err("yukizygisk: policydb_write failed: %d\n", ret);
+		vfree(data);
+		return ret;
+	}
+	len -= fp.len;
+
+	ret = yz_security_load_policy(yz_selinux_state, data, len);
+	vfree(data);
+	if (ret)
+		pr_err("yukizygisk: security_load_policy failed: %d\n", ret);
+	return ret;
+}
+#endif
+
+static int
 yz_policy_commit_edit_locked(struct yz_policy_edit *edit)
 {
+#if YZ_KERNEL_LEGACY
+	int ret = yz_policy_install_legacy(edit->policy);
+
+	if (ret)
+		return ret;
+	yz_policy_destroy(edit->policy);
+	memset(edit, 0, sizeof(*edit));
+	yz_policy_refresh_view_locked();
+	return 0;
+#else
 	rcu_assign_pointer(yz_selinux_state->policy, edit->policy);
 	synchronize_rcu();
 	yz_policy_destroy(edit->old_policy);
 	yz_policy_reset_avc();
 	memset(edit, 0, sizeof(*edit));
+	return 0;
+#endif
 }
 
 int yz_policy_base_commit_allow_locked(const struct yz_policy_key *file_key,
@@ -772,7 +918,9 @@ int yz_policy_base_commit_allow_locked(const struct yz_policy_key *file_key,
 			goto out_cancel;
 	}
 
-	yz_policy_commit_edit_locked(&edit);
+	ret = yz_policy_commit_edit_locked(&edit);
+	if (ret)
+		goto out_cancel;
 	return 0;
 
 out_cancel:
@@ -821,7 +969,9 @@ int yz_policy_base_commit_restore_locked(
 			goto out_cancel;
 	}
 
-	yz_policy_commit_edit_locked(&edit);
+	ret = yz_policy_commit_edit_locked(&edit);
+	if (ret)
+		goto out_cancel;
 	return 0;
 
 out_cancel:
@@ -839,13 +989,23 @@ int yz_policy_base_lock(void)
 		mutex_unlock(&yz_policy_lock);
 		return -EOPNOTSUPP;
 	}
+#if YZ_KERNEL_LEGACY
+	if (!yz_selinux_state->ss) {
+		mutex_unlock(&yz_policy_lock);
+		return -EOPNOTSUPP;
+	}
+	yz_policy_refresh_view_locked();
+#else
 	mutex_lock(&yz_selinux_state->policy_mutex);
+#endif
 	return 0;
 }
 
 void yz_policy_base_unlock(void)
 {
+#if !YZ_KERNEL_LEGACY
 	mutex_unlock(&yz_selinux_state->policy_mutex);
+#endif
 	mutex_unlock(&yz_policy_lock);
 }
 
@@ -901,9 +1061,7 @@ yz_policy_base_get_file_load_keys(
 	if (!ssid || !tsid)
 		return -EINVAL;
 
-	policy = rcu_dereference_protected(
-		yz_selinux_state->policy,
-		lockdep_is_held(&yz_selinux_state->policy_mutex));
+	policy = yz_policy_current_locked();
 	if (!policy)
 		return -ENOENT;
 
@@ -984,9 +1142,7 @@ yz_policy_base_get_execmem_key(const struct cred *cred,
 	if (!ssid)
 		return -EINVAL;
 
-	policy = rcu_dereference_protected(
-		yz_selinux_state->policy,
-		lockdep_is_held(&yz_selinux_state->policy_mutex));
+	policy = yz_policy_current_locked();
 	if (!policy)
 		return -ENOENT;
 
@@ -1024,8 +1180,19 @@ int yz_host_policy_init(void)
 		(void *)yz_lookup_callable_quiet("policydb_read");
 	yz_policydb_destroy =
 		(void *)yz_lookup_callable_quiet("policydb_destroy");
+#if YZ_KERNEL_LEGACY
+	yz_hashtab_search =
+		(void *)yz_lookup_callable_quiet("hashtab_search");
+	yz_sidtab_search_fn =
+		(void *)yz_lookup_callable_quiet("sidtab_search");
+	yz_security_load_policy =
+		(void *)yz_lookup_callable_quiet("security_load_policy");
+#else
 	yz_symtab_search =
 		(void *)yz_lookup_callable_quiet("symtab_search");
+	yz_sidtab_search_entry =
+		(void *)yz_lookup_callable_quiet("sidtab_search_entry");
+#endif
 	yz_avtab_search_node =
 		(void *)yz_lookup_callable_quiet("avtab_search_node");
 	yz_avtab_insert_nonunique =
@@ -1034,8 +1201,6 @@ int yz_host_policy_init(void)
 		(void *)yz_lookup_callable_quiet("avtab_alloc");
 	yz_avtab_destroy =
 		(void *)yz_lookup_callable_quiet("avtab_destroy");
-	yz_sidtab_search_entry =
-		(void *)yz_lookup_callable_quiet("sidtab_search_entry");
 	yz_avc_ss_reset =
 		(void *)yz_lookup_callable_quiet("avc_ss_reset");
 	yz_selnl_notify_policyload =
@@ -1065,12 +1230,18 @@ void yz_host_policy_exit(void)
 	yz_policydb_write = NULL;
 	yz_policydb_read = NULL;
 	yz_policydb_destroy = NULL;
+#if YZ_KERNEL_LEGACY
+	yz_hashtab_search = NULL;
+	yz_sidtab_search_fn = NULL;
+	yz_security_load_policy = NULL;
+#else
 	yz_symtab_search = NULL;
+	yz_sidtab_search_entry = NULL;
+#endif
 	yz_avtab_search_node = NULL;
 	yz_avtab_insert_nonunique = NULL;
 	yz_avtab_alloc = NULL;
 	yz_avtab_destroy = NULL;
-	yz_sidtab_search_entry = NULL;
 	yz_avc_ss_reset = NULL;
 	yz_selnl_notify_policyload = NULL;
 	yz_selinux_status_update_policyload = NULL;
@@ -1093,10 +1264,26 @@ bool yz_host_policy_cred_has_type(const struct cred *cred,
 	if (!sid)
 		return false;
 
+#if YZ_KERNEL_LEGACY
+	{
+		struct selinux_ss *ss = yz_selinux_state->ss;
+
+		if (!ss)
+			return false;
+		read_lock(&ss->policy_rwlock);
+		yz_policy_view.policydb = ss->policydb;
+		yz_policy_view.sidtab = ss->sidtab;
+		read_unlock(&ss->policy_rwlock);
+	}
+	policy = &yz_policy_view;
+	if (!policy)
+		goto out_unlock;
+#else
 	rcu_read_lock();
 	policy = rcu_dereference(yz_selinux_state->policy);
 	if (!policy)
 		goto out_unlock;
+#endif
 
 	ctx = yz_policy_sidtab_search(policy->sidtab, sid);
 	if (!ctx)
@@ -1107,6 +1294,8 @@ bool yz_host_policy_cred_has_type(const struct cred *cred,
 	match = name && !strcmp(name, type_name);
 
 out_unlock:
+#if !YZ_KERNEL_LEGACY
 	rcu_read_unlock();
+#endif
 	return match;
 }

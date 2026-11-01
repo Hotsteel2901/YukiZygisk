@@ -126,6 +126,7 @@ static int yz_find_kernel_symbol_exact_cb(void *data, unsigned long addr)
 
 static unsigned long yz_lookup_via_kprobe(const char *name)
 {
+#if IS_ENABLED(CONFIG_KPROBES)
 	struct kprobe kp = { .symbol_name = name };
 	unsigned long addr;
 
@@ -134,6 +135,10 @@ static unsigned long yz_lookup_via_kprobe(const char *name)
 	addr = (unsigned long)kp.addr;
 	unregister_kprobe(&kp);
 	return yz_valid_kernel_addr(addr) ? addr : 0;
+#else
+	(void)name;
+	return 0;
+#endif
 }
 
 static YZ_INDIRECT_CALL unsigned long
@@ -291,7 +296,15 @@ YZ_INDIRECT_CALL unsigned long yz_lookup_callable_quiet(const char *name)
 
 static int yz_init_symbol_resolver(void)
 {
-	unsigned long addr = yz_lookup_via_kprobe("kallsyms_lookup_name");
+	unsigned long addr;
+
+#ifdef YZ_KALLSYMS_LOOKUP_EXPORTED
+	/* Pre-5.7 non-GKI kernels export this symbol directly and commonly ship
+	 * without CONFIG_KPROBES (the OnePlus 8 4.19 kernel does). */
+	addr = (unsigned long)kallsyms_lookup_name;
+#else
+	addr = yz_lookup_via_kprobe("kallsyms_lookup_name");
+#endif
 
 	if (!addr) {
 		pr_err("yukizygisk: failed to bootstrap kallsyms_lookup_name\n");
@@ -315,6 +328,20 @@ yz_kernel_read_nofault(void *dst, unsigned long src, size_t size)
 			(void *)yz_lookup_callable_quiet(
 				"copy_from_kernel_nofault");
 
+#if YZ_KERNEL_LEGACY
+	/* copy_from_kernel_nofault() arrived in 5.8; 4.x spells it
+	 * probe_kernel_read() with the same argument order. */
+	if (!yz_copy_from_kernel_nofault_fn) {
+		static long (*probe_read)(void *, const void *, size_t);
+
+		if (!probe_read)
+			probe_read = (void *)yz_lookup_callable_quiet(
+				"probe_kernel_read");
+		if (!probe_read)
+			return false;
+		return probe_read(dst, (const void *)src, size) == 0;
+	}
+#endif
 	return yz_copy_from_kernel_nofault_fn &&
 	       yz_copy_from_kernel_nofault_fn(dst, (const void *)src, size) == 0;
 }

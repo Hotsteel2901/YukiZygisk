@@ -13,10 +13,12 @@
 #include <linux/atomic.h>
 #include <linux/errno.h>
 #include <linux/fdtable.h>
+#include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mm.h>
+#include <linux/sched/mm.h>
 #include <linux/magic.h>
 #include <linux/pid.h>
 #include <linux/printk.h>
@@ -45,6 +47,25 @@ static DECLARE_RWSEM(yz_control_sem);
 
 #ifndef fd_file
 #define fd_file(fd) ((fd).file)
+#endif
+
+#if YZ_KERNEL_LEGACY
+/* get_task_cred() is not exported before 5.x; the 4.x implementation is a
+ * short RCU loop and needs no extra symbol. */
+static const struct cred *yz_control_get_task_cred(struct task_struct *task)
+{
+	const struct cred *cred;
+
+	rcu_read_lock();
+	do {
+		cred = __task_cred(task);
+		BUG_ON(!cred);
+	} while (!atomic_long_inc_not_zero(&((struct cred *)cred)->usage));
+	rcu_read_unlock();
+	return cred;
+}
+#else
+#define yz_control_get_task_cred(task) get_task_cred(task)
 #endif
 
 static bool yz_is_appuid(uid_t uid)
@@ -140,7 +161,7 @@ static int yz_ioctl_allow_module_load_policy(void __user *arg)
 		put_task_struct(task);
 		return ret;
 	}
-	cred = get_task_cred(task);
+	cred = yz_control_get_task_cred(task);
 	payload = fdget(cmd.dirfd);
 	file = fd_file(payload);
 	if (!file) {

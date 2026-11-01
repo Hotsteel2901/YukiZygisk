@@ -44,11 +44,21 @@ yukizygisk-objs := \
 	feature/fd_handoff.o
 
 ccflags-y += -I$(src)
+
+# Legacy non-GKI kernels (Linux 4.14/4.19) build with -std=gnu89 and lack the
+# versioned helpers the GKI targets rely on.  The portability shim below is
+# force-included for every translation unit on those kernels.
+YZ_KERNEL_LEGACY := $(shell [ "$(VERSION)" -lt 5 ] && echo 1)
+ifeq ($(YZ_KERNEL_LEGACY),1)
+ccflags-y += -DYZ_KERNEL_LEGACY=1 -include $(src)/compat/legacy.h
+ccflags-y += -Wno-gcc-compat -Wno-division-by-zero
+endif
 VIOLA_BUILD_DIR ?= $(src)/../build/viola
 ccflags-y += -I$(src)/../shared/viola -I$(VIOLA_BUILD_DIR)
-CFLAGS_core/viola_shared.o += -std=gnu11
-CFLAGS_core/viola_monocypher.o += -std=gnu11 -DVIOLA_NO_ARGON2
-CFLAGS_core/viola_ed25519.o += -std=gnu11
+# pre-5.18 kernels default to -std=gnu89; the shared crypto sources need C99.
+CFLAGS_viola_shared.o += -std=gnu11
+CFLAGS_viola_monocypher.o += -std=gnu11 -DVIOLA_NO_ARGON2
+CFLAGS_viola_ed25519.o += -std=gnu11
 ifneq ($(strip $(VIOLA_KMI_ID)),)
 ccflags-y += -DVIOLA_KMI_ID=$(VIOLA_KMI_ID) -DVIOLA_BUILD_KMI=$(VIOLA_KMI_ID)
 endif
@@ -83,6 +93,12 @@ ccflags-y += -DYZ_EXIT_HAS_GROUP_DEAD
 endif
 
 yz-endpoint-symvers := $(firstword $(wildcard $(objtree)/Module.symvers $(KDIR)/Module.symvers $(KERNEL_SRC)/Module.symvers))
+# pre-5.7 kernels export kallsyms_lookup_name; use the direct reference when
+# the target kernel's Module.symvers provides it and fall back to kprobes
+# only when it does not.
+ifneq ($(shell awk '$$2 == "kallsyms_lookup_name" {print "1"; exit}' $(yz-endpoint-symvers) 2>/dev/null),)
+ccflags-y += -DYZ_KALLSYMS_LOOKUP_EXPORTED=1
+endif
 yz-endpoint-vfs-ns := $(if $(yz-endpoint-symvers),$(shell awk '$$2 == "dentry_open" {print $$5; exit}' $(yz-endpoint-symvers)))
 ifneq ($(strip $(yz-endpoint-vfs-ns)),)
 ccflags-y += -DYZ_ENDPOINT_VFS_NS=$(yz-endpoint-vfs-ns)

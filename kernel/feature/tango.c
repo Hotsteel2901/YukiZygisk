@@ -17,6 +17,7 @@
 #include <linux/pid_namespace.h>
 #include <linux/rcupdate.h>
 #include <linux/sched.h>
+#include <linux/sched/mm.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/task_work.h>
