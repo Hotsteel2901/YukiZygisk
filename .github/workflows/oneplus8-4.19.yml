@@ -116,6 +116,8 @@ jobs:
           set -euo pipefail
           signing_home="$RUNNER_TEMP/dev-signing"
           install -d -m 0700 "$signing_home"
+          # GITHUB_ENV only reaches later steps; this step needs the home now.
+          export GNUPGHOME="$signing_home"
           echo "GNUPGHOME=$signing_home" >> "$GITHUB_ENV"
           gpg --batch --pinentry-mode loopback --passphrase '' \
             --quick-gen-key "YukiZygisk CI development key <dev@invalid>" \

@@ -216,7 +216,9 @@ def valid_time(sig, now):
 
 def validate_certificate(data, signer_fpr, profile):
     """Validate the selected chain itself, not only GPG's printed key flags."""
-    if not data or len(data) > 65536:
+    if not data:
+        fail("public certificate is empty; GNUPGHOME does not hold the signing key")
+    if len(data) > 65536:
         fail("public certificate exceeds its 64 KiB bound")
     rows = list(packets(data))
     if not rows or rows[0][0] != 6 or sum(tag == 6 for tag, _ in rows) != 1:
