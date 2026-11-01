@@ -32,6 +32,27 @@ If the installer cannot identify your kernel's KMI, use **Volume Up** to cycle t
 
 If something goes wrong, [open an issue](https://github.com/Rouyashiki/YukiZygisk/issues) with your device model, Android and kernel versions, root implementation, steps to reproduce and the output from the Action button.
 
+## OnePlus 8 (Linux 4.19)
+
+This fork adds a device-specific, non-GKI target called `oneplus8-4.19` for the OnePlus 8 family (`instantnoodle`, `instantnoodlep`, `kebab`) on LineageOS 24.0, whose vendor kernel is Linux 4.19.325.
+
+- The target carries KMI id `9` and the `oneplus8-4.19` identity string inside the LKM. The installer picks it without any volume-key prompt when `ro.product.device` matches and the kernel release starts with `4.19.`.
+- Build locally with a prepared vendor kernel tree (`vmlinux` plus `Module.symvers`):
+
+  ```sh
+  ./build.sh kernel  --kmi oneplus8-4.19 --kdir out
+  ./build.sh package --kmi oneplus8-4.19 --kdir out
+  ```
+
+- The dedicated workflow [`.github/workflows/oneplus8-4.19.yml`](.github/workflows/oneplus8-4.19.yml) builds the LKM from `LineageOS/android_kernel_oneplus_sm8250@lineage-24.0`, verifies every symbol against `System.map`, then packages a single-KMI ZIP. Without a `GPG_PRIVATE_KEY` secret it falls back to a throw-away development signing key so the artifact stays installable.
+- 4.19 compatibility work lives in `kernel/compat/legacy.h` and the individual call sites: SELinux policy edits go through `security_load_policy()`, mount cleanup uses the private `do_umount()` instead of `path_umount()`, nofault reads fall back to `probe_kernel_read()`, and `bprm` exec-fd access uses `interp_flags`/`interp_data`.
+
+Limitations:
+
+- The module links against a specific kernel build. modversions CRCs and structure layouts must match the running kernel, so rebuild after switching kernel branches or configurations; the bundled loader only repairs the vermagic string.
+- Mount cleanup depends on the private `do_umount()` symbol being present in kallsyms. It degrades to a no-op with a single `pr_warn()` line when it is missing.
+- Only `LineageOS` kernels with `CONFIG_MODULES`, `CONFIG_MODVERSIONS` and `CONFIG_SECURITY_SELINUX` are tested.
+
 ## License
 
 Original work is licensed under [Apache-2.0](LICENSE); [GPL-2.0](LICENSE-GPL-2.0) applies when used with the Linux kernel. Third-party components retain their original licenses. See [NOTICE](NOTICE) for credits and details.

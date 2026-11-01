@@ -74,14 +74,28 @@ Build shape:
 ```bash
 ./build.sh kernel -k android15-6.6
 ./build.sh kernel --all-kmis
+# Non-GKI target: build against a prepared vendor kernel tree.
+./build.sh kernel -k oneplus8-4.19 --kdir /path/to/kernel-out
 ```
 
 The default single target is pinned by `.ddk-version`; KMI-tagged outputs are
 written under `build/out/lkm/`.
 
 The build first prepares `build/viola` and the final stripped Viola digest.
-Direct kernel builds must provide `VIOLA_KMI_ID` (1 through 7 in the build
-script's target order); `VIOLA_BUILD_DIR` defaults to the sibling
-`build/viola`. Both the image identity and expected loader digest are preserved
-as ELF notes and checked by the package signer. See the top-level README for
-public-only official builds and independent development signing.
+Direct kernel builds must provide `VIOLA_KMI_ID` (1 through 8 in the build
+script's GKI target order, 9 for `oneplus8-4.19`); `VIOLA_BUILD_DIR` defaults to
+the sibling `build/viola`. Both the image identity and expected loader digest
+are preserved as ELF notes and checked by the package signer. See the top-level
+README for public-only official builds and independent development signing.
+
+Non-GKI targets bypass DDK: `build.sh` runs `make -C kernel KDIR=…` against the
+vendor tree in `--kdir`, which must already contain `.config`, `Module.symvers`
+and a built `vmlinux`. `VIOLA_KMI_ID` is derived from the target list, so the
+LKM and the userspace payloads always agree on the KMI index.
+
+Kernels older than 5.0 are detected from `VERSION`/`PATCHLEVEL` in `Kbuild`;
+`compat/legacy.h` is force-included and supplies the `MODULE_IMPORT_NS`,
+`TWA_*`, `CANARY_MASK`, `__nocfi` and `start_boottime` shims. Remaining
+differences are handled at the call site, search for `YZ_KERNEL_LEGACY` to find
+every 4.19 branch (SELinux policy installation, `do_umount`, nofault reads,
+`bprm` exec fd, `get_task_cred`).
