@@ -253,7 +253,9 @@ jobs:
           test -s kernel/yukizygisk.ko
           mkdir -p build/out/lkm
           cp kernel/yukizygisk.ko "build/out/lkm/${YZ_KMI}_yukizygisk.ko"
-          llvm-strip -d "build/out/lkm/${YZ_KMI}_yukizygisk.ko"
+          # The runner ships clang but not the LLVM binutils, and
+          # binutils-aarch64-linux-gnu is already a build dependency.
+          aarch64-linux-gnu-strip --strip-debug "build/out/lkm/${YZ_KMI}_yukizygisk.ko"
           cp "$GITHUB_WORKSPACE/kernel-out/Module.symvers" build/out/lkm/Module.symvers
           cp "$GITHUB_WORKSPACE/kernel-out/include/config/kernel.release" build/out/lkm/kernel.release
           ls -lh build/out/lkm
@@ -266,7 +268,8 @@ jobs:
           # modpost already resolved every import against Module.symvers; a
           # non-empty list here means the module references a non-exported
           # symbol and must not be packaged.
-          unresolved="$(llvm-nm -u "build/out/lkm/${YZ_KMI}_yukizygisk.ko" | awk '{print $2}' | sort -u)"
+          unresolved="$(aarch64-linux-gnu-nm -u "build/out/lkm/${YZ_KMI}_yukizygisk.ko" |
+            awk '{print $2}' | sort -u)"
           printf '%s\n' "$unresolved"
           printf '%s\n' "$unresolved" | while read -r symbol; do
             [ -z "$symbol" ] && continue
