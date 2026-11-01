@@ -70,9 +70,14 @@ esac
 KERNEL_RELEASE="$(uname -r 2>/dev/null)" || abort "! Cannot read kernel release"
 [ -n "$KERNEL_RELEASE" ] || abort "! Cannot read kernel release"
 if ! KMI="$(yz_detect_kmi "$KERNEL_RELEASE")"; then
-	ui_print "- Cannot detect GKI KMI from kernel release: $KERNEL_RELEASE"
-	yz_select_kmi "$MODPATH" ||
-		abort "! Cannot select KMI: no packaged LKM or volume-key input unavailable/timed out"
+	ui_print "- Cannot detect KMI from kernel release: $KERNEL_RELEASE"
+	# A device-specific package ships a single LKM; it needs no prompt.
+	KMI="$(yz_single_kmi "$MODPATH")" ||
+		KMI=""
+	if [ -z "$KMI" ]; then
+		yz_select_kmi "$MODPATH" ||
+			abort "! Cannot select KMI: no packaged LKM or volume-key input unavailable/timed out"
+	fi
 fi
 KERNEL_MODULE="$(yz_kmi_ko "$MODPATH" "$KMI")"
 if [ ! -f "$KERNEL_MODULE" ]; then

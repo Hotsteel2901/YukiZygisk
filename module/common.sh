@@ -14,8 +14,33 @@ yz_detect_kmi() {
 	yz_kernel="$(printf '%s\n' "$yz_release" |
 		sed -n 's/^\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')"
 
-	[ -n "$yz_android" ] && [ -n "$yz_kernel" ] || return 1
-	printf '%s-%s\n' "$yz_android" "$yz_kernel"
+	if [ -n "$yz_android" ] && [ -n "$yz_kernel" ]; then
+		printf '%s-%s\n' "$yz_android" "$yz_kernel"
+		return 0
+	fi
+
+	# Non-GKI vendor kernels (OnePlus 8 series, Linux 4.19) carry no
+	# androidNN tag; identify them by release and device codename instead.
+	case "$yz_release" in
+	4.19.*)
+		yz_device="$(getprop ro.product.device 2>/dev/null)"
+		case "$yz_device" in
+		instantnoodle | instantnoodlep | kebab)
+			printf '%s\n' "oneplus8-4.19"
+			return 0
+			;;
+		esac
+		;;
+	esac
+	return 1
+}
+
+yz_single_kmi() {
+	[ -d "$1/lkm" ] || return 1
+	set -- "$1"/lkm/*_yukizygisk.ko
+	[ "$#" -eq 1 ] && [ -f "$1" ] || return 1
+	yz_name="${1##*/}"
+	printf '%s\n' "${yz_name%_yukizygisk.ko}"
 }
 
 yz_kmi_ko() {

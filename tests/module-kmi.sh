@@ -31,6 +31,18 @@ check_kmi "6.1.115-android14-11-gki" "android14-6.1"
 check_kmi "6.6.56-android15-8-gki" "android15-6.6"
 check_kmi "6.12.23-android16-3-gki" "android16-6.12"
 
+# Non-GKI OnePlus 8 family kernels (Linux 4.19) have no androidNN tag; the
+# installer identifies them by release and device codename.
+getprop() { printf '%s\n' "${YZ_TEST_DEVICE:-}"; }
+YZ_TEST_DEVICE=instantnoodle check_kmi "4.19.325-perf-g12345678" "oneplus8-4.19"
+YZ_TEST_DEVICE=kebab check_kmi "4.19.325-perf-g12345678" "oneplus8-4.19"
+YZ_TEST_DEVICE=someotherdevice
+if yz_detect_kmi "4.19.325-perf-g12345678" >/dev/null; then
+	echo "non-OnePlus 4.19 release unexpectedly produced a KMI" >&2
+	exit 1
+fi
+unset YZ_TEST_DEVICE
+
 if yz_detect_kmi "6.6.56-vendor-kernel" >/dev/null; then
 	echo "non-GKI release unexpectedly produced a KMI" >&2
 	exit 1
