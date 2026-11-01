@@ -671,6 +671,7 @@ package_module() {
 	[[ -f "$OUT_DIR/zygiskd64" && -f "$OUT_DIR/zygiskd32" ]] ||
 		die "missing dual-ABI daemon outputs"
 	[[ -f "$OUT_DIR/yzctl" ]] || die "missing yzctl output"
+	[[ -f "$OUT_DIR/viola" ]] || die "missing frozen Viola executable: build/out/viola"
 	check_staged_kernels
 
 	info "Stage module"
@@ -745,7 +746,6 @@ ensure_viola() {
 	if [[ "$SKIP_VIOLA" == true ]]; then
 		[[ -f "$VIOLA_CONTEXT/context.json" && -f "$VIOLA_CONTEXT/viola_build.h" ]] ||
 			die "--skip-viola requires a prepared build context in $VIOLA_CONTEXT"
-		[[ -f "$OUT_DIR/viola" ]] || die "--skip-viola requires build/out/viola"
 		[[ -f "$VIOLA_CONTEXT/viola_loader.h" ]] ||
 			die "--skip-viola requires build/viola/viola_loader.h"
 		info "Skip Viola build"
@@ -768,15 +768,15 @@ kernel)
 	build_kernel
 	;;
 daemon)
-	prepare_viola
+	ensure_viola
 	build_daemon
 	;;
 ctl)
-	prepare_viola
+	ensure_viola
 	build_ctl
 	;;
 payloads)
-	prepare_viola
+	ensure_viola
 	build_payloads
 	;;
 package)

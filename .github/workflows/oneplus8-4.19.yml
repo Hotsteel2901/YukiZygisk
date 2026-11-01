@@ -349,9 +349,11 @@ jobs:
       - name: Build daemon, control client, and runtime payloads
         run: |
           set -euo pipefail
-          ./build.sh daemon
-          ./build.sh ctl
-          ./build.sh payloads
+          # Reuse the shared context verbatim: re-preparing it here would
+          # rebuild the identity with the default profile.
+          ./build.sh daemon --skip-viola
+          ./build.sh ctl --skip-viola
+          ./build.sh payloads --skip-viola
 
       - name: Upload userspace artifacts
         uses: actions/upload-artifact@v6
@@ -467,10 +469,13 @@ jobs:
             { echo "no secret signing key imported" >&2; exit 1; }
 
       - name: Package module
+        env:
+          SIGNING_PROFILE: ${{ needs.prepare-viola.outputs.signing }}
         run: |
           set -euo pipefail
           ./build.sh package --kmi "$YZ_KMI" --skip-viola --skip-kernel \
-            --skip-daemon --skip-ctl --skip-payloads
+            --skip-daemon --skip-ctl --skip-payloads \
+            --viola-profile "$SIGNING_PROFILE"
           unzip -Z1 build/out/YukiZygisk-*-"$YZ_KMI"-arm64-v8a.zip | sort
 
       - name: Upload module package
