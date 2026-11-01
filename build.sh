@@ -35,6 +35,8 @@ STRIP_ANDROID=true
 VERBOSE=false
 ALL_KMIS=false
 SKIP_VIOLA=false
+KDIR_PATH="${YZ_KDIR:-}"
+JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 VIOLA_CONTEXT="$BUILD_DIR/viola"
 VIOLA_PYTHON="${VIOLA_PYTHON:-python3}"
 VIOLA_PROFILE="${VIOLA_PROFILE:-official}"
@@ -50,6 +52,13 @@ KMI_TARGETS=(
 	android17-6.18
 )
 
+# Non-GKI targets are built from a prepared vendor kernel tree instead of DDK.
+# Their Viola KMI IDs continue the GKI numbering above.
+KMI_LEGACY_TARGETS=(
+	oneplus8-4.19
+)
+KMI_LEGACY_BASE_ID=${#KMI_TARGETS[@]}
+
 usage() {
 	cat <<EOF
 YukiZygisk local build and module packager.
@@ -60,8 +69,10 @@ Usage:
 WebUI packaging requires Node.js 24 and npm (also available as ./build.sh webui).
 
 Options:
-  -k, --kmi KMI              Build/package one DDK target (default: .ddk-version)
-      --all-kmis             Build/package every supported KMI
+  -k, --kmi KMI              Build/package one KMI target (default: .ddk-version)
+      --all-kmis             Build/package every DDK KMI
+      --kdir PATH            Prepared non-GKI kernel tree (Linux 4.19 target)
+  -j, --jobs N               Parallel jobs for the non-GKI kernel module
   -a, --abi ABI              Primary device ABI; compat ARM is always included
       --android-platform API Android platform (default: android-31)
       --ndk PATH             Android NDK path
@@ -89,6 +100,14 @@ while [[ $# -gt 0 ]]; do
 	--all-kmis)
 		ALL_KMIS=true
 		shift
+		;;
+	--kdir)
+		KDIR_PATH="$2"
+		shift 2
+		;;
+	-j | --jobs)
+		JOBS="$2"
+		shift 2
 		;;
 	-a | --abi)
 		ABI="$2"
@@ -281,9 +300,34 @@ kernel_targets() {
 	fi
 }
 
+is_legacy_kmi() {
+	local target="$1" candidate
+	for candidate in "${KMI_LEGACY_TARGETS[@]}"; do
+		[[ "$candidate" != "$target" ]] || return 0
+	done
+	return 1
+}
+
+kmi_id() {
+	local target="$1" index
+	for index in "${!KMI_TARGETS[@]}"; do
+		if [[ "${KMI_TARGETS[$index]}" == "$target" ]]; then
+			printf '%s\n' "$((index + 1))"
+			return 0
+		fi
+	done
+	for index in "${!KMI_LEGACY_TARGETS[@]}"; do
+		if [[ "${KMI_LEGACY_TARGETS[$index]}" == "$target" ]]; then
+			printf '%s\n' "$((KMI_LEGACY_BASE_ID + index + 1))"
+			return 0
+		fi
+	done
+	return 1
+}
+
 validate_kmi() {
 	local target="$1"
-	[[ "$target" =~ ^android[0-9]+-[0-9]+\.[0-9]+$ ]] ||
+	[[ "$target" =~ ^android[0-9]+-[0-9]+\.[0-9]+$ ]] || is_legacy_kmi "$target" ||
 		die "invalid KMI target: $target"
 }
 
@@ -314,24 +358,52 @@ check_staged_kernels() {
 	done < <(kernel_targets)
 }
 
+build_legacy_kernel() {
+	local target="$1"
+	local output id
+	output="$(lkm_output_path "$target")"
+	id="$(kmi_id "$target")"
+
+	[[ -n "$KDIR_PATH" ]] ||
+		die "$target needs --kdir pointing at a prepared kernel tree"
+	[[ -f "$KDIR_PATH/Module.symvers" ]] ||
+		die "$KDIR_PATH has no Module.symvers; build the kernel (vmlinux) first"
+	[[ -f "$KDIR_PATH/.config" ]] || die "$KDIR_PATH is not configured"
+
+	info "Build yukizygisk.ko against $KDIR_PATH ($target, kmi id $id)"
+	make -C "$PROJECT_ROOT/kernel" -j"$JOBS" \
+		KDIR="$KDIR_PATH" ARCH="${YZ_KERNEL_ARCH:-arm64}" \
+		CC="${YZ_KERNEL_CC:-clang}" \
+		CLANG_TRIPLE="${YZ_KERNEL_CLANG_TRIPLE:-aarch64-linux-gnu-}" \
+		CROSS_COMPILE="${YZ_KERNEL_CROSS_COMPILE:-aarch64-linux-gnu-}" \
+		VIOLA_KMI_ID="$id"
+	[[ -f "$PROJECT_ROOT/kernel/yukizygisk.ko" ]] ||
+		die "kernel module build completed but kernel/yukizygisk.ko is missing"
+}
+
 build_one_kernel() {
 	local target="$1"
-	local output
+	local output id
 	validate_kmi "$target"
 	output="$(lkm_output_path "$target")"
 
+	if is_legacy_kmi "$target"; then
+		build_legacy_kernel "$target"
+		mkdir -p "$LKM_OUT_DIR"
+		cp "$PROJECT_ROOT/kernel/yukizygisk.ko" "$output"
+		strip_kernel_file "$output"
+		info "Kernel: $output"
+		return
+	fi
+
 	info "Build yukizygisk.ko with DDK ($target)"
-	local kmi_id=0 index
-	for index in "${!KMI_TARGETS[@]}"; do
-		[[ "${KMI_TARGETS[$index]}" != "$target" ]] || kmi_id=$((index + 1))
-	done
-	((kmi_id > 0)) || die "unsupported KMI: $target"
+	id="$(kmi_id "$target")"
 	case "$target" in
 	android15-6.6 | android16-6.12 | android17-6.18)
-		ddk build --target "$target" -- W=1 VIOLA_KMI_ID="$kmi_id"
+		ddk build --target "$target" -- W=1 VIOLA_KMI_ID="$id"
 		;;
 	*)
-		ddk build --target "$target" -- VIOLA_KMI_ID="$kmi_id"
+		ddk build --target "$target" -- VIOLA_KMI_ID="$id"
 		;;
 	esac
 	[[ -f "$PROJECT_ROOT/kernel/yukizygisk.ko" ]] ||
@@ -350,8 +422,13 @@ build_kernel() {
 		return
 	fi
 
-	check_kernel_deps
 	local target
+	while IFS= read -r target; do
+		if ! is_legacy_kmi "$target"; then
+			check_kernel_deps
+			break
+		fi
+	done < <(kernel_targets)
 	if [[ "$ALL_KMIS" == true ]]; then
 		while IFS= read -r target; do
 			rm -f "$(lkm_output_path "$target")"
@@ -658,9 +735,24 @@ clean() {
 	rm -rf "$BUILD_DIR"
 	local target
 	while IFS= read -r target; do
+		is_legacy_kmi "$target" && continue
 		ddk clean --target "$target" >/dev/null 2>&1 || true
 	done < <(kernel_targets)
 	info "Cleaned"
+}
+
+ensure_viola() {
+	if [[ "$SKIP_VIOLA" == true ]]; then
+		[[ -f "$VIOLA_CONTEXT/context.json" && -f "$VIOLA_CONTEXT/viola_build.h" ]] ||
+			die "--skip-viola requires a prepared build context in $VIOLA_CONTEXT"
+		[[ -f "$OUT_DIR/viola" ]] || die "--skip-viola requires build/out/viola"
+		[[ -f "$VIOLA_CONTEXT/viola_loader.h" ]] ||
+			die "--skip-viola requires build/viola/viola_loader.h"
+		info "Skip Viola build"
+		return
+	fi
+	prepare_viola
+	build_viola
 }
 
 case "$COMMAND" in
@@ -672,8 +764,7 @@ viola)
 	build_viola
 	;;
 kernel)
-	prepare_viola
-	build_viola
+	ensure_viola
 	build_kernel
 	;;
 daemon)
@@ -690,8 +781,7 @@ payloads)
 	;;
 package)
 	build_webui
-	prepare_viola
-	build_viola
+	ensure_viola
 	build_kernel
 	build_daemon
 	build_ctl
@@ -699,7 +789,7 @@ package)
 	package_module
 	if [[ "$KEEP_BUILD" != true ]]; then
 		rm -rf "${BUILD_DIR:?}/$ABI" "${PACKAGE_DIR:?}"
-		if [[ "$ALL_KMIS" != true ]]; then
+		if [[ "$ALL_KMIS" != true ]] && ! is_legacy_kmi "$KMI"; then
 			ddk clean --target "$KMI" >/dev/null 2>&1 || true
 		fi
 	fi

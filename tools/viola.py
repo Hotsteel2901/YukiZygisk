@@ -24,7 +24,8 @@ SIGNER = "C01D42FA249B2E23C28F4B0347E533340DE325A5"
 MAGIC = b"VIOLA\0\1\0"
 PROJECT = b"YukiZygisk".ljust(16, b"\0")
 KMIS = ["none", "android12-5.10", "android13-5.10", "android13-5.15",
-        "android14-5.15", "android14-6.1", "android15-6.6", "android16-6.12", "android17-6.18"]
+        "android14-5.15", "android14-6.1", "android15-6.6", "android16-6.12", "android17-6.18",
+        "oneplus8-4.19"]
 PATHS = {(1, 1, 0): "bin/viola", (3, 1, 0): "bin/zygiskd64",
          (3, 2, 0): "bin/zygiskd32", (4, 1, 0): "bin/yzctl"}
 for _role, _name in [(5, "libyukilinker.so"), (6, "libzygisk.so"), (7, "libyukizncore.so")]:

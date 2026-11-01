@@ -208,7 +208,8 @@ const char *viola_kmi_name(uint32_t kmi)
 {
 	static const char *const names[] = {"none",	      "android12-5.10", "android13-5.10",
 					    "android13-5.15", "android14-5.15", "android14-6.1",
-					    "android15-6.6",  "android16-6.12", "android17-6.18"};
+					    "android15-6.6",  "android16-6.12", "android17-6.18",
+					    "oneplus8-4.19"};
 	return kmi < sizeof(names) / sizeof(names[0]) ? names[kmi] : NULL;
 }
 
