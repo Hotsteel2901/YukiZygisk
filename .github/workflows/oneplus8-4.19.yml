@@ -190,7 +190,7 @@ jobs:
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Restore kernel object cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: kernel-out
           key: kona-4.19-${{ steps.krev.outputs.sha }}-${{ hashFiles('kernel-src/arch/arm64/configs/vendor/kona-perf_defconfig', 'kernel-src/arch/arm64/configs/vendor/oplus.config') }}
